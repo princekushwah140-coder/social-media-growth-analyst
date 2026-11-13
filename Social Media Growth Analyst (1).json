@@ -1,0 +1,309 @@
+{
+  "name": "Social Media Growth Analyst",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "id": "30b6fbdf-83fc-42b1-a17a-ec959053d4f7",
+      "name": "Weekly Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "ig_user_id",
+              "value": "your_ig-user_id",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "access_token",
+              "value": "your_ig_access_token",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "niche",
+              "value": "Family & Kids Comedy (AI-generated entertainment)",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "goal",
+              "value": "Grow followers and reach",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "gemini_model",
+              "value": "gemini-3.6-flash",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1ca58b71-0006-4bff-ba1c-a2feb46e7550",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.instagram.com/v21.0/me/media",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,caption,media_type,media_product_type,timestamp,permalink,like_count,comments_count"
+            },
+            {
+              "name": "limit",
+              "value": "30"
+            },
+            {
+              "name": "access_token",
+              "value": "={{ $json.access_token }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "41125f91-9339-4112-bc20-fc8e3e820c1f",
+      "name": "Get Recent Media",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        448,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "data",
+        "options": {}
+      },
+      "id": "8670b768-adfe-4e58-ad41-54c55824e79f",
+      "name": "Split Out",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        672,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $json.id }}/insights",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "metric",
+              "value": "reach,saved,shares,total_interactions"
+            },
+            {
+              "name": "access_token",
+              "value": "={{ $('Config').first().json.access_token }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "6aef412e-2085-4da6-a51f-fb5efc1a514b",
+      "name": "Get Post Insights",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        0
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Posts from Split Out\nconst media = $('Split Out').all().map(i => i.json);\n// Insights from Get Post Insights\nconst insightItems = $input.all();\n\n// Build a lookup by media id so order and failures don't matter.\n// Requires the insights node to expose the media id (see \"How to verify\").\nconst insightsById = new Map();\nconst errors = [];\n\ninsightItems.forEach((item, idx) => {\n  const j = item.json || {};\n  const id = j._media_id || j.media_id || media[idx]?.id; // fallback: index\n  if (!id) return;\n  if (j.error) {\n    errors.push({ id, code: j.error.code, message: j.error.message });\n    return;\n  }\n  insightsById.set(id, j);\n});\n\nconst metric = (res, name) => {\n  const m = (res?.data || []).find(d => d.name === name);\n  if (!m) return null;\n  return m.total_value?.value ?? m.values?.[0]?.value ?? null;\n};\n\nconst sum = (...vals) => vals.reduce((a, v) => a + (v ?? 0), 0);\n\nconst posts = media.map(m => {\n  const ins = insightsById.get(m.id) || {};\n  const likes = m.like_count ?? null;\n  const comments = m.comments_count ?? null;\n  const shares = metric(ins, 'shares');\n  const saves = metric(ins, 'saved');\n  const reach = metric(ins, 'reach');\n  const views = metric(ins, 'views') ?? metric(ins, 'plays');\n\n  // Engagement from whatever is available, flagged when partial\n  const hasAll = [likes, comments, shares, saves].every(v => v !== null);\n  const engagement = sum(likes, comments, shares, saves);\n\n  return {\n    id: m.id,\n    timestamp: m.timestamp,\n    media_type: m.media_type,\n    permalink: m.permalink,\n    caption: (m.caption || '').slice(0, 120),\n    likes, comments, shares, saves, reach, views,\n    engagement,\n    engagement_complete: hasAll,\n    er_reach_pct: reach > 0 ? +(engagement / reach * 100).toFixed(2) : null\n  };\n}).filter(p => p.id);\n\nif (posts.length === 0) {\n  throw new Error('No posts built. Check Split Out and Get Post Insights output.');\n}\n\n// Data-quality summary\nconst withReach = posts.filter(p => p.reach !== null).length;\nconst withViews = posts.filter(p => p.views !== null).length;\nconst reachAvailable = withReach > 0;\n\n// Ranking: reach-based ER if available, otherwise absolute engagement\nconst rankKey = reachAvailable ? 'er_reach_pct' : 'engagement';\nconst ranked = posts\n  .filter(p => p[rankKey] !== null)\n  .sort((a, b) => b[rankKey] - a[rankKey]);\n\nconst n = Math.max(1, Math.round(ranked.length * 0.2));\nconst top = ranked.slice(0, n);\nconst bottom = ranked.length >= 10 ? ranked.slice(-n).reverse() : [];\n\nconst prompt =\n`Account niche: Family & Kids Comedy (AI-generated entertainment)\nGoal: Grow followers and reach\nPosts analysed: ${posts.length} (last 30 fetched)\nEngagement rate denominator: ${reachAvailable ? 'reach' : 'UNAVAILABLE - ranking by absolute engagement'}\n\nDATA QUALITY:\n- Posts with reach: ${withReach}/${posts.length}\n- Posts with views: ${withViews}/${posts.length}\n- Insight API errors: ${JSON.stringify(errors.slice(0, 5))}\n- Ranking metric: ${rankKey}\n\nTOP 20%:\n${JSON.stringify(top)}\n\nBOTTOM 20%:\n${JSON.stringify(bottom)}\n\nALL POSTS:\n${JSON.stringify(posts)}\n\nFollow your instructions and produce the weekly report.`;\n\nreturn [{\n  json: {\n    prompt,\n    post_count: posts.length,\n    reach_available: reachAvailable,\n    insight_errors: errors.length\n  }\n}];"
+      },
+      "id": "735845f7-17f5-41fc-8a95-2f92c6c777dc",
+      "name": "Compute Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1104,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $('Config').first().json.gemini_model }}:generateContent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-goog-api-key",
+              "value": "your_Google_api_key"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  systemInstruction: { parts: [{ text: `You are a senior Instagram Growth Analyst specializing in AI-generated family comedy, Instagram Reels, audience engagement, and data-driven content strategy.\n\nACCOUNT:\nFamily & Kids Comedy — an Instagram account publishing AI-generated comedy shorts.\n\nOBJECTIVE:\nAnalyze the Instagram post data supplied in the user's prompt and generate a professional, actionable weekly growth report.\n\nDATA REQUIREMENTS:\n\n1. Read and analyze the actual post records included in the input.\n2. Never invent post records, metrics, dates, engagement rates, reach, views, follower counts, or performance results.\n3. Use only numbers supported by the supplied data or calculations from those numbers.\n4. Mark unavailable metrics as N/A.\n5. Distinguish measured facts from hypotheses and recommendations.\n6. If no individual post records are supplied, return a compact HTML message stating \"No post data received. Report not generated.\" Do not produce a generic report, ask the user to paste data, or fabricate an analysis.\n7. If fewer than 30 posts are supplied, analyze the available posts and clearly state the actual sample size. Never claim to have analyzed 30 posts unless 30 records are present.\n8. If fewer than five posts are supplied, omit performance scores and top-versus-bottom 20% comparisons.\n9. Never assume that an unavailable metric equals zero.\n\nMETRIC RULES:\n\n* Calculate engagement rate using (likes + comments + shares + saves) / followers × 100 only when all required values are available and refer to compatible measurement periods.\n* If reach is available and a reach-based engagement rate is requested, calculate (likes + comments + shares + saves) / reach × 100 instead. Clearly label the denominator used.\n* Do not mix follower-based and reach-based engagement rates.\n* Calculate averages, totals, percentages, and rankings only from valid available data.\n* Exclude missing values from calculations where appropriate and disclose the reduced sample size.\n* Do not infer retention, watch time, follows, or conversions without supporting data.\n* Format large numbers using K and M where helpful.\n* Do not treat correlation as proof of causation.\n\nREPORT SECTIONS:\n\n1. EXECUTIVE SUMMARY\n   Summarize the account's actual performance, strongest observation, biggest opportunity, and overall direction. Include the sample size.\n\n2. WEEKLY PERFORMANCE DASHBOARD\n   Present a compact table containing available metrics:\n\n* Posts analyzed\n* Total likes\n* Total comments\n* Total reach\n* Total views\n* Average likes per post\n* Average comments per post\n* Engagement rate with its denominator clearly identified\n\nUse N/A for unavailable metrics.\n\n3. TOP-PERFORMING CONTENT\n   Rank the strongest posts using an explicitly stated metric supported by the data. Include post descriptions or shortened captions, actual performance values, and permalinks when supplied. Explain patterns only when the evidence supports them.\n\n4. UNDERPERFORMING CONTENT\n   Identify weaker posts using the same comparison metric. Explain possible reasons as hypotheses, not proven facts. Never claim that a hook, posting time, audio, or hashtag caused poor performance without supporting evidence.\n\n5. TOP 20% VS BOTTOM 20%\n   When the sample contains at least five posts and comparable performance metrics are available, compare the highest-performing and lowest-performing groups. State the grouping method and sample sizes. Compare available characteristics such as format, topic, caption, hook, video duration, posting time, and hashtag count. Mark unsupported comparisons as N/A.\n\n6. PERFORMANCE INSIGHTS\n   Provide up to five evidence-based findings. For each finding, include:\n\n* Observation\n* Supporting data\n* Confidence level: High, Medium, or Low\n* Practical implication\n\nDo not claim statistical significance unless the data and analysis justify it. Warn when a comparison uses too few posts or when variables are confounded.\n\n7. FIVE PRIORITIZED IMPROVEMENTS\n   Rank five recommendations by expected impact and implementation effort. For each, state the evidence, recommended action, and a measurable success indicator. Label recommendations based on general expertise as hypotheses when account-specific evidence is missing.\n\n8. THREE CONTROLLED EXPERIMENTS FOR NEXT WEEK\n   Propose three practical experiments. Each must include:\n\n* Hypothesis\n* Single variable being tested\n* What remains constant\n* Measurement metric\n* Success criterion\n* Suggested test procedure\n\nUse actual account data to inform experiments. If the necessary baseline is unavailable, explicitly label the experiment as exploratory.\n\n9. NEXT-SEVEN-DAYS ACTION PLAN\n   Provide a concise, ordered plan for improving content quality, testing ideas, and reviewing results.\n\n10. FINAL TAKEAWAY\n    Summarize the most important action the creator should take next.\n\nHTML DESIGN REQUIREMENTS:\n\n* Return a complete HTML email document.\n* Use inline CSS only.\n* Use a clean, modern, professional design suitable for Gmail.\n* Use a dark navy header with a purple accent.\n* Use a white background, readable typography, subtle borders, rounded metric cards, and alternating table rows.\n* Use table-based layouts where appropriate for email-client compatibility.\n* Make section headings bold and visually distinct.\n* Highlight important metrics and findings without excessive colors.\n* Include clear separation between observations, hypotheses, and recommendations.\n* Use responsive-friendly widths and spacing.\n* Do not use JavaScript, external stylesheets, external fonts, or interactive elements.\n* Escape dynamic text where necessary to prevent captions or other input content from breaking the HTML.\n* Keep visible report text at or below 250 words, excluding necessary HTML markup.\n* Use N/A for missing metrics.\n* Do not include Markdown tables, Markdown headings, Markdown code fences, or explanatory text outside the HTML document.\n* Do not include instructions asking the reader to paste or upload data.\n* Do not produce placeholder sections such as [PENDING DATA INPUT] when valid post data is available.\n\nFINAL VALIDATION:\nBefore returning the report, verify that individual post records exist in the input, every reported number is supported, calculations are correct, the sample size is accurate, and the result is valid HTML.\n\nReturn only the HTML report.\n\n` }] },\n  contents: [{ role: 'user', parts: [{ text: $json.prompt }] }],\n  generationConfig: { maxOutputTokens: 8000 }\n}) }}",
+        "options": {}
+      },
+      "id": "8b4289fc-79bf-4425-b095-d4a8adb308ed",
+      "name": "Gemini Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1328,
+        0
+      ],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "sendTo": "guest1412008@gmail.com",
+        "subject": "=Instagram Weekly Growth Report - {{ $now.toFormat('dd LLL yyyy') }}",
+        "message": "={{ $json.candidates[0].content.parts.map(p => p.text).join('') }}",
+        "options": {}
+      },
+      "id": "8f9cb118-da75-453a-ab5d-92ef0362720c",
+      "name": "Email Report",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1552,
+        0
+      ],
+      "webhookId": "70bf6e74-f92e-4fca-880c-19b33d0614a1",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "QLZyVaHvtXj0nZxs",
+          "name": "Gmail account 2"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Weekly Trigger": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Get Recent Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Recent Media": {
+      "main": [
+        [
+          {
+            "node": "Split Out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Out": {
+      "main": [
+        [
+          {
+            "node": "Get Post Insights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Post Insights": {
+      "main": [
+        [
+          {
+            "node": "Compute Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Metrics": {
+      "main": [
+        [
+          {
+            "node": "Gemini Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Analysis": {
+      "main": [
+        [
+          {
+            "node": "Email Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "20b392b5-b733-419b-89d4-b27b90669117",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "bded55b0c8aae409dea82358155b41e5b06c3cd7c5e8a269f8a8bd90fd45a53b"
+  },
+  "nodeGroups": [],
+  "id": "zBmXYLnWIUvcqnka",
+  "tags": []
+}
